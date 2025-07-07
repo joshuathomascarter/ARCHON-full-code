@@ -4,13 +4,20 @@ module pipeline_cpu(
     input wire [15:0] external_entropy_in, // Input from entropy_bus.txt (for Entropy Control Logic)
     input wire [7:0] analog_entropy_raw_in, // Raw analog entropy for shock filter and decoder
     input wire [1:0] ml_predicted_action, // ML model's predicted action for AHO and FSM
+
+    // New Input for Trigger Authorizer: ml_risk_flag (distinct from ml_predicted_action for FSM)
+    input wire ml_risk_flag_in,         // ML model's high-risk flag for weapon trigger authorization
+
+    // New Input for Trigger Authorizer: Manual Lock
+    input wire manual_lock_in,          // Manual override for weapon trigger system
+
     input wire internal_hazard_flag_for_fsm, // This is an input to pipeline_cpu from archon_top
 
     input wire analog_lock_override_in,  // From top-level analog controller
     input wire analog_flush_override_in, // From top-level analog controller
     input wire quantum_override_signal_in, // Quantum override signal from Qiskit simulation
 
-    // NEW Military-Grade Control Inputs for FSM
+    // Military-Grade Control Inputs for fsm_entropy_overlay
     input wire [1:0] mission_profile_in,        // Mission profile for FSM
     input wire override_authentication_valid_in, // Authentication signal for overrides
     input wire [7:0] entropy_threshold_fsm_in,  // Dynamic entropy threshold for FSM
@@ -25,7 +32,10 @@ module pipeline_cpu(
     output wire debug_hazard_flag,      // Expose the internal hazard flag
     output wire [1:0] debug_fsm_state,  // Expose the FSM state
     output wire debug_shock_detected,   // Expose shock detected from filter
-    output wire [1:0] debug_classified_entropy // Expose classified entropy from decoder
+    output wire [1:0] debug_classified_entropy, // Expose classified entropy from decoder
+
+    // NEW Output: Weapon Trigger Authorization Pulse
+    output wire enable_fire_pulse_out    // 1-cycle pulse when weapon fire is authorized
 );
 
     // --- Active Low Reset for Modules that use it ---
@@ -144,7 +154,7 @@ module pipeline_cpu(
     wire [1:0] new_fsm_control_signal;
     wire [7:0] new_fsm_entropy_log;
     wire [2:0] new_fsm_instr_type_log;
-    wire shock_detected_internal; // Internal wire for shock filter output
+    wire shock_detected_internal; // Internal wire for shock filter output (used by both FSMs)
 
     localparam AHO_SCALED_FLUSH_THRESH = 21'd1000000; // Example threshold
     localparam AHO_SCALED_STALL_THRESH = 21'd500000;  // Example threshold
@@ -156,6 +166,10 @@ module pipeline_cpu(
 
     wire pd_anomaly_detected_out;
     wire pd_reset; // Correctly declare pd_reset
+
+    // --- Internal wire for trigger_authorizer output ---
+    wire trigger_enable_fire_internal;
+
 
     // --- Instantiate Sub-modules ---
     instruction_ram i_imem (
@@ -214,7 +228,7 @@ module pipeline_cpu(
     wire [3:0] qed_instr_opcode_input;
     assign qed_instr_opcode_input = id_ex_instr_reg[15:12];
     wire qed_reset = reset;
-    wire [7:0] qed_entropy_score_out;
+    wire [7:0] qed_entropy_score_out; // Output used for fsm_entropy_overlay AND trigger_authorizer
     quantum_entropy_detector i_qed (
         .clk(clk),
         .reset(qed_reset),
@@ -250,7 +264,7 @@ module pipeline_cpu(
         .clk(clk),
         .reset(reset),
         .analog_entropy_in(analog_entropy_raw_in),
-        .shock_detected(shock_detected_internal)
+        .shock_detected(shock_detected_internal) // This output is used by both FSMs
     );
 
     // This block is the sole driver for branch_miss_rate_counter
@@ -263,11 +277,11 @@ module pipeline_cpu(
                     if (branch_miss_rate_counter < 8'hFF) begin
                         branch_miss_rate_counter <= branch_miss_rate_counter + 8'h1;
                     end
-                end else begin
+                end else begin // Correct: 'begin' for the else block
                     if (branch_miss_rate_counter > 8'h0) begin
                         branch_miss_rate_counter <= branch_miss_rate_counter - 8'h1;
                     end
-                end
+                end // Correct: End of 'else begin' block
             end
         end
     end
@@ -283,7 +297,7 @@ module pipeline_cpu(
         .branch_miss_rate_tracker(debug_branch_miss_rate),
         .cache_miss_rate_tracker(cache_miss_rate_dummy),
         .exec_pressure_tracker(exec_pressure_counter),
-        .ml_predicted_action(ml_predicted_action),
+        .ml_predicted_action(ml_predicted_action), // ML action for AHO
         .scaled_flush_threshold(AHO_SCALED_FLUSH_THRESH),
         .scaled_stall_threshold(AHO_SCALED_STALL_THRESH),
         .override_flush_sig(aho_override_flush_req),
@@ -322,14 +336,17 @@ module pipeline_cpu(
         end
     end
 
-    // NEW: Entropy-Aware FSM
+    // ===============================================================
+    // NEW: Entropy-Aware CPU Control FSM (fsm_entropy_overlay)
+    // This FSM manages CPU pipeline behavior based on system health.
+    // ===============================================================
     // Consolidate AHO's requests with the 'internal_hazard_flag_for_fsm' input
     assign new_fsm_internal_hazard_flag = aho_override_flush_req || aho_override_stall_req || internal_hazard_flag_for_fsm;
 
     fsm_entropy_overlay i_entropy_fsm (
         .clk(clk),
         .rst_n(rst_n),
-        .ml_predicted_action(ml_predicted_action),
+        .ml_predicted_action(ml_predicted_action), // ML action for FSM
         .internal_entropy_score(qed_entropy_score_out),
         .internal_hazard_flag(new_fsm_internal_hazard_flag),
         .classified_entropy_level(classified_entropy_level_wire),
@@ -338,17 +355,34 @@ module pipeline_cpu(
         .analog_lock_override(analog_lock_override_in),
         .analog_flush_override(analog_flush_override_in),
         .quantum_override_signal(quantum_override_signal_in),
-        .shock_detected_in(shock_detected_internal), // NEW: Connect shock filter output
+        .shock_detected_in(shock_detected_internal), // Connect shock filter output
 
-        // NEW Military-Grade Control Inputs (passed from pipeline_cpu's ports)
         .mission_profile_in(mission_profile_in),
         .override_authentication_valid_in(override_authentication_valid_in),
         .entropy_threshold_fsm_in(entropy_threshold_fsm_in),
-        
+
         .fsm_state(new_fsm_control_signal),
         .entropy_log_out(new_fsm_entropy_log),
         .instr_type_log_out(new_fsm_instr_type_log)
     );
+
+    // ===============================================================
+    // NEW: Weapon Trigger Authorizer FSM
+    // This FSM controls authorization for weapon firing.
+    // ===============================================================
+    trigger_authorizer i_trigger_authorizer (
+        .clk(clk),
+        .rst_n(rst_n),
+        .entropy_score(qed_entropy_score_out), // Use QED entropy score
+        .analog_spike_detected(shock_detected_internal), // Use shock detector output as analog spike
+        .ml_risk_flag(ml_risk_flag_in),         // ML risk flag input
+        .manual_lock(manual_lock_in),           // Manual lock input
+
+        .enable_fire(trigger_enable_fire_internal) // Output fire authorization pulse
+    );
+
+    assign enable_fire_pulse_out = trigger_enable_fire_internal;
+
 
     wire entropy_ctrl_stall;
     wire entropy_ctrl_flush;
@@ -389,11 +423,11 @@ module pipeline_cpu(
                     if (exec_pressure_counter < 8'hFF) begin
                         exec_pressure_counter <= exec_pressure_counter + 8'h1;
                     end
-                end else begin
+                end else begin // Corrected: Using 'begin'
                     if (exec_pressure_counter > 8'h0) begin
                         exec_pressure_counter <= exec_pressure_counter - 8'h1;
                     end
-                end
+                end // Corrected: End of 'else begin'
                 // Dummy cache miss rate logic
                 if (cache_miss_rate_dummy < 8'hFF && (exec_pressure_counter % 5 == 0)) begin
                     cache_miss_rate_dummy <= cache_miss_rate_dummy + 8'h1;
@@ -414,9 +448,9 @@ module pipeline_cpu(
                 pc_reg <= 4'h0;
             end else if (pipeline_stall) begin
                 pc_reg <= pc_reg;
-            end else begin
+            end else begin // Corrected: Using 'begin'
                 pc_reg <= next_pc;
-            end
+            end // Corrected: End of 'else begin'
         end
     end
 
@@ -428,9 +462,9 @@ module pipeline_cpu(
         end else if (ex_mem_is_branch_inst_reg) begin
             if (branch_actual_taken) begin
                 next_pc = ex_mem_branch_target_reg;
-            end else begin
+            end else begin // Corrected: Using 'begin'
                 next_pc = ex_mem_pc_plus_1_reg;
-            end
+            end // Corrected: End of 'else begin'
         end else if (if_btb_predicted_taken) begin
             next_pc = if_btb_predicted_next_pc;
         end
@@ -465,7 +499,7 @@ module pipeline_cpu(
     assign id_mem_write_enable = (id_opcode == 4'h5);
     assign id_is_branch_inst   = (id_opcode == 4'h7);
     assign id_is_jump_inst     = (id_opcode == 4'h8);
-    assign id_branch_target    = id_instr[3:0];
+    assign id_branch_target     = id_instr[3:0];
 
     always @(*) begin
         case (id_opcode)
@@ -563,8 +597,8 @@ module pipeline_cpu(
                 ex_mem_mem_write_data_reg   <= ex_alu_operand2;
                 ex_mem_rd_addr_reg          <= ex_rd_addr;
                 ex_mem_reg_write_enable_reg <= ex_reg_write_enable;
-                ex_mem_mem_read_enable_reg  <= ex_mem_read_enable;
-                ex_mem_mem_write_enable_reg <= ex_mem_write_enable;
+                ex_mem_mem_read_enable_reg  <= ex_mem_mem_read_enable;
+                ex_mem_mem_write_enable_reg <= ex_mem_mem_write_enable;
                 ex_mem_zero_flag_reg        <= ex_zero_flag;
                 ex_mem_is_branch_inst_reg   <= ex_is_branch_inst;
                 ex_mem_is_jump_inst_reg     <= ex_is_jump_inst;
@@ -616,9 +650,9 @@ module pipeline_cpu(
             if (~pipeline_flush && ~pipeline_stall) begin
                 if (mem_mem_read_enable) begin
                     mem_wb_write_data_reg <= mem_read_data;
-                end else begin
+                end else begin // Corrected: Using 'begin'
                     mem_wb_write_data_reg <= mem_alu_result;
-                end
+                end // Corrected: End of 'else begin'
                 mem_wb_rd_addr_reg <= mem_rd_addr;
                 mem_wb_reg_write_enable_reg <= mem_reg_write_enable;
             end
@@ -642,3 +676,8 @@ module pipeline_cpu(
     assign debug_fsm_state = new_fsm_control_signal;
     assign debug_shock_detected = shock_detected_internal;
     assign debug_classified_entropy = classified_entropy_level_wire;
+
+endmodule
+
+
+
