@@ -2,15 +2,18 @@ module pipeline_cpu(
     input wire clk,
     input wire reset, // Active high reset (converts to active low for some modules)
     input wire [15:0] external_entropy_in, // Input from entropy_bus.txt (for Entropy Control Logic)
-    input wire [7:0] analog_entropy_raw_in, // NEW INPUT: Raw analog entropy for shock filter and decoder
+    input wire [7:0] analog_entropy_raw_in, // Raw analog entropy for shock filter and decoder
     input wire [1:0] ml_predicted_action, // ML model's predicted action for AHO and FSM
     input wire internal_hazard_flag_for_fsm, // This is an input to pipeline_cpu from archon_top
 
-    // START OF ADDED PARTS: Analog Override Inputs for pipeline_cpu and Quantum Override
     input wire analog_lock_override_in,  // From top-level analog controller
     input wire analog_flush_override_in, // From top-level analog controller
-    input wire quantum_override_signal_in, // NEW: Quantum override signal from Qiskit simulation
-    // END OF ADDED PARTS
+    input wire quantum_override_signal_in, // Quantum override signal from Qiskit simulation
+
+    // NEW Military-Grade Control Inputs for FSM
+    input wire [1:0] mission_profile_in,        // Mission profile for FSM
+    input wire override_authentication_valid_in, // Authentication signal for overrides
+    input wire [7:0] entropy_threshold_fsm_in,  // Dynamic entropy threshold for FSM
 
     output wire [3:0] debug_pc,         // For debugging: current PC
     output wire [15:0] debug_instr,      // For debugging: current instruction
@@ -18,11 +21,11 @@ module pipeline_cpu(
     output wire debug_flush,            // For debugging: indicates pipeline flush
     output wire debug_lock,             // For debugging: indicates system lock
     output wire [7:0] debug_fsm_entropy_log, // For debugging: entropy value logged by new FSM
-    output wire [2:0] debug_fsm_instr_type_log, // NEW: Debug output for logged instruction type
-    output wire debug_hazard_flag,      // NEW OUTPUT: Expose the internal hazard flag
-    output wire [1:0] debug_fsm_state,  // NEW OUTPUT: Expose the FSM state
-    output wire debug_shock_detected,   // NEW OUTPUT: Expose shock detected from filter
-    output wire [1:0] debug_classified_entropy // NEW OUTPUT: Expose classified entropy from decoder
+    output wire [2:0] debug_fsm_instr_type_log, // Debug output for logged instruction type
+    output wire debug_hazard_flag,      // Expose the internal hazard flag
+    output wire [1:0] debug_fsm_state,  // Expose the FSM state
+    output wire debug_shock_detected,   // Expose shock detected from filter
+    output wire [1:0] debug_classified_entropy // Expose classified entropy from decoder
 );
 
     // --- Active Low Reset for Modules that use it ---
@@ -129,7 +132,7 @@ module pipeline_cpu(
 
     // For simplicity, tracking rough execution pressure
     reg [7:0] exec_pressure_counter;
-    reg [7:0] cache_miss_rate_dummy;
+    reg [7:0] cache_miss_rate_dummy; // Dummy value, requires actual cache model to be meaningful
 
     // AHO internal hazard signals
     wire aho_override_flush_req;
@@ -143,17 +146,16 @@ module pipeline_cpu(
     wire [2:0] new_fsm_instr_type_log;
     wire shock_detected_internal; // Internal wire for shock filter output
 
-    localparam AHO_SCALED_FLUSH_THRESH = 21'd1000000;
-    localparam AHO_SCALED_STALL_THRESH = 21'd500000;
+    localparam AHO_SCALED_FLUSH_THRESH = 21'd1000000; // Example threshold
+    localparam AHO_SCALED_STALL_THRESH = 21'd500000;  // Example threshold
 
     wire [1:0] classified_entropy_level_wire; // Internal wire for classified entropy
 
-    // --- Explicit declaration for debug_branch_miss_rate ---
     wire [7:0] debug_branch_miss_rate;
-    reg [7:0] branch_miss_rate_counter; // Declared once here
+    reg [7:0] branch_miss_rate_counter;
 
-    // ADDED: Explicit declarations for implicit nets
     wire pd_anomaly_detected_out;
+    wire pd_reset; // Correctly declare pd_reset
 
     // --- Instantiate Sub-modules ---
     instruction_ram i_imem (
@@ -233,8 +235,7 @@ module pipeline_cpu(
         .chaos_score_out(cd_chaos_score_out)
     );
 
-    // ADDED: Assign pd_reset
-    assign pd_reset = reset;
+    assign pd_reset = reset; // Connect pd_reset
     pattern_detector i_pattern_detector (
         .clk(clk),
         .reset(pd_reset),
@@ -245,11 +246,10 @@ module pipeline_cpu(
         .anomaly_detected_out(pd_anomaly_detected_out)
     );
 
-    // NEW: Instantiate Entropy Shock Filter
     entropy_shock_filter u_entropy_shock_filter (
         .clk(clk),
-        .reset(reset), // Uses active high reset
-        .analog_entropy_in(analog_entropy_raw_in), // Connect to the new raw analog entropy input
+        .reset(reset),
+        .analog_entropy_in(analog_entropy_raw_in),
         .shock_detected(shock_detected_internal)
     );
 
@@ -257,8 +257,7 @@ module pipeline_cpu(
     always @(posedge clk or posedge reset) begin
         if (reset) begin
             branch_miss_rate_counter <= 8'h0;
-        end else begin // Not reset
-            // Only update if not stalled AND not flushed (normal pipeline advance)
+        end else begin
             if (~pipeline_stall && ~pipeline_flush) begin
                 if (branch_mispredicted) begin
                     if (branch_miss_rate_counter < 8'hFF) begin
@@ -270,12 +269,10 @@ module pipeline_cpu(
                     end
                 end
             end
-            // Implicitly holds if pipeline_stall or pipeline_flush is true
         end
     end
 
     assign debug_branch_miss_rate = branch_miss_rate_counter;
-
 
     archon_hazard_override_unit i_aho (
         .clk(clk),
@@ -295,7 +292,7 @@ module pipeline_cpu(
     );
 
     entropy_trigger_decoder i_entropy_decoder (
-        .entropy_in(analog_entropy_raw_in), // Connect to the new raw analog entropy input
+        .entropy_in(analog_entropy_raw_in), // Connect to the raw analog entropy input
         .signal_class(classified_entropy_level_wire)
     );
 
@@ -319,14 +316,11 @@ module pipeline_cpu(
         if (reset) begin
             instr_type_to_fsm_reg <= 3'b111; // Default to OTHER on reset
         end else begin
-            // Only update if not stalled AND not flushed
             if (~pipeline_stall && ~pipeline_flush) begin
                 instr_type_to_fsm_reg <= instr_type_to_fsm_comb;
             end
-            // Implicitly holds if pipeline_stall or pipeline_flush is true
         end
     end
-
 
     // NEW: Entropy-Aware FSM
     // Consolidate AHO's requests with the 'internal_hazard_flag_for_fsm' input
@@ -338,12 +332,18 @@ module pipeline_cpu(
         .ml_predicted_action(ml_predicted_action),
         .internal_entropy_score(qed_entropy_score_out),
         .internal_hazard_flag(new_fsm_internal_hazard_flag),
+        .classified_entropy_level(classified_entropy_level_wire),
+        .instr_type(instr_type_to_fsm_reg),
+
         .analog_lock_override(analog_lock_override_in),
         .analog_flush_override(analog_flush_override_in),
-        .classified_entropy_level(classified_entropy_level_wire),
         .quantum_override_signal(quantum_override_signal_in),
-        .instr_type(instr_type_to_fsm_reg), // CHANGED: Use the registered version
         .shock_detected_in(shock_detected_internal), // NEW: Connect shock filter output
+
+        // NEW Military-Grade Control Inputs (passed from pipeline_cpu's ports)
+        .mission_profile_in(mission_profile_in),
+        .override_authentication_valid_in(override_authentication_valid_in),
+        .entropy_threshold_fsm_in(entropy_threshold_fsm_in),
         
         .fsm_state(new_fsm_control_signal),
         .entropy_log_out(new_fsm_entropy_log),
@@ -352,33 +352,40 @@ module pipeline_cpu(
 
     wire entropy_ctrl_stall;
     wire entropy_ctrl_flush;
+    // Assuming entropy_control_logic exists elsewhere or is a placeholder
+    // If this module is not provided, you'll need to define it or remove this instantiation.
+    /*
     entropy_control_logic i_entropy_ctrl (
         .external_entropy_in(external_entropy_in),
         .entropy_stall(entropy_ctrl_stall),
         .entropy_flush(entropy_ctrl_flush)
     );
+    */
+    // For now, if entropy_control_logic is not defined, tie these off to avoid errors.
+    assign entropy_ctrl_stall = 1'b0;
+    assign entropy_ctrl_flush = 1'b0;
+
 
     // --- Pipeline Control Unit ---
-    assign pipeline_flush = (new_fsm_control_signal == 2'b10) ||
-                            (new_fsm_control_signal == 2'b11) ||
-                            entropy_ctrl_flush;
+    assign pipeline_flush = (new_fsm_control_signal == 2'b10) || // FSM recommends FLUSH
+                            (new_fsm_control_signal == 2'b11) || // FSM recommends LOCK (also implies flush)
+                            entropy_ctrl_flush;                   // Old entropy control also recommends flush
 
-    assign pipeline_stall = (new_fsm_control_signal == 2'b01) ||
-                            (new_fsm_control_signal == 2'b11) ||
-                            entropy_ctrl_stall;
+    assign pipeline_stall = (new_fsm_control_signal == 2'b01) || // FSM recommends STALL
+                            (new_fsm_control_signal == 2'b11) || // FSM recommends LOCK (also implies stall)
+                            entropy_ctrl_stall;                   // Old entropy control also recommends stall
 
     // --- Execution Pressure Counter ---
     always @(posedge clk or posedge reset) begin
         if (reset) begin
             exec_pressure_counter <= 8'h0;
             cache_miss_rate_dummy <= 8'h0;
-        end else begin // Not reset
-            // If flush, reset counters. Otherwise, if not stalled, update.
+        end else begin
             if (pipeline_flush) begin
                 exec_pressure_counter <= 8'h0;
                 cache_miss_rate_dummy <= 8'h0;
-            end else if (~pipeline_stall) begin // Only update if not stalled
-                if (if_id_instr_reg[15:12] != 4'h9) begin // Assuming 4'h9 is a NOP or low-pressure instruction
+            end else if (~pipeline_stall) begin
+                if (id_ex_instr_reg[15:12] != 4'h9) begin // Assuming 4'h9 is a NOP or low-pressure instruction
                     if (exec_pressure_counter < 8'hFF) begin
                         exec_pressure_counter <= exec_pressure_counter + 8'h1;
                     end
@@ -387,41 +394,35 @@ module pipeline_cpu(
                         exec_pressure_counter <= exec_pressure_counter - 8'h1;
                     end
                 end
-                // Replaced $urandom_range with a simple, deterministic counter for simulation.
-                // This will make cache_miss_rate_dummy increment/decrement predictably.
-                // The value will increment by 1 every 5 execution pressure units, and decrement by 1 every 7 units.
+                // Dummy cache miss rate logic
                 if (cache_miss_rate_dummy < 8'hFF && (exec_pressure_counter % 5 == 0)) begin
                     cache_miss_rate_dummy <= cache_miss_rate_dummy + 8'h1;
                 end else if (cache_miss_rate_dummy > 8'h0 && (exec_pressure_counter % 7 == 0)) begin
                     cache_miss_rate_dummy <= cache_miss_rate_dummy - 8'h1;
                 end
             end
-            // Implicitly holds if pipeline_stall is true and not flushed
         end
     end
 
     // --- IF Stage ---
-    assign if_pc_plus_1 = pc_reg + 4'b0001; // Constant is 4-bit for consistency
+    assign if_pc_plus_1 = pc_reg + 4'b0001;
     always @(posedge clk or posedge reset) begin
         if (reset) begin
             pc_reg <= 4'h0;
         end else begin
-            // PC update logic: reset on flush, hold on stall, advance otherwise
-            if (pipeline_flush) begin // Synchronous flush
+            if (pipeline_flush) begin
                 pc_reg <= 4'h0;
-            end else if (pipeline_stall) begin // Synchronous stall
-                pc_reg <= pc_reg; // Hold current PC
-            end else begin // Normal advance
+            end else if (pipeline_stall) begin
+                pc_reg <= pc_reg;
+            end else begin
                 pc_reg <= next_pc;
             end
         end
     end
 
-    // Corrected next_pc logic for proper prioritization of control signals
     always @(*) begin
-        next_pc = if_pc_plus_1; // Default to incrementing PC
+        next_pc = if_pc_plus_1;
 
-        // Branch/Jump logic takes priority over simple increment when not stalled/flushed
         if (ex_mem_is_jump_inst_reg) begin
             next_pc = ex_mem_branch_target_reg;
         end else if (ex_mem_is_branch_inst_reg) begin
@@ -433,23 +434,18 @@ module pipeline_cpu(
         end else if (if_btb_predicted_taken) begin
             next_pc = if_btb_predicted_next_pc;
         end
-        // The actual update of pc_reg (with next_pc) is handled in the always @(posedge clk) block
-        // where pipeline_stall and pipeline_flush are considered.
     end
 
-
-    // IF-ID Pipeline Register (Line 428 in your error log)
+    // IF-ID Pipeline Register
     always @(posedge clk or posedge reset) begin
-        if (reset) begin // Asynchronous reset
+        if (reset) begin
             if_id_pc_plus_1_reg <= 4'h0;
             if_id_instr_reg <= 16'h0000;
-        end else begin // Synchronous logic
-            // Combine flush and stall into one synchronous enable
-            if (~pipeline_flush && ~pipeline_stall) begin // ONLY update if NOT FLUSHED AND NOT STALLED
+        end else begin
+            if (~pipeline_flush && ~pipeline_stall) begin
                 if_id_pc_plus_1_reg <= if_pc_plus_1;
                 if_id_instr_reg <= if_instr;
             end
-            // Implicitly holds if pipeline_stall or pipeline_flush is true
         end
     end
 
@@ -461,7 +457,7 @@ module pipeline_cpu(
     assign id_rd_addr = id_instr[11:9];
     assign id_rs1_addr = id_instr[8:6];
     assign id_rs2_addr = id_instr[5:3];
-    assign id_immediate = {1'b0, id_instr[2:0]}; // Ensure 4-bit immediate if needed, or adjust size
+    assign id_immediate = {1'b0, id_instr[2:0]};
 
     assign id_reg_write_enable = (id_opcode == 4'h1 || id_opcode == 4'h2 || id_opcode == 4'h3 ||
                                   id_opcode == 4'h4 || id_opcode == 4'h6 || id_opcode == 4'h0);
@@ -474,12 +470,12 @@ module pipeline_cpu(
     always @(*) begin
         case (id_opcode)
             4'h1: id_alu_op = 3'b000; // ADD
-            4'h2: id_alu_op = 3'b000; // SUB (assuming ALU handles different ops for same opcode or 4'h2 is also ADD for some reason)
+            4'h2: id_alu_op = 3'b000; // SUB
             4'h3: id_alu_op = 3'b001; // AND
             4'h4: id_alu_op = 3'b000; // LOAD
             4'h5: id_alu_op = 3'b000; // STORE
             4'h6: id_alu_op = 3'b100; // XOR
-            4'h7: id_alu_op = 3'b001; // BEQ (branch on equal, needs a comparison op. 'AND' is usually not for comparison. This might be a logical mismatch with your ALU definition.)
+            4'h7: id_alu_op = 3'b001; // BEQ
             default: id_alu_op = 3'b000; // Default ALU operation
         endcase
     end
@@ -498,7 +494,7 @@ module pipeline_cpu(
 
     // ID-EX Pipeline Register
     always @(posedge clk or posedge reset) begin
-        if (reset) begin // Asynchronous reset
+        if (reset) begin
             id_ex_pc_plus_1_reg <= 4'h0;
             id_ex_operand1_reg <= 4'h0;
             id_ex_operand2_reg <= 4'h0;
@@ -512,9 +508,8 @@ module pipeline_cpu(
             id_ex_branch_target_reg <= 4'h0;
             id_ex_instr_reg <= 16'h0000;
             id_ex_branch_pc_reg <= 4'h0;
-        end else begin // Synchronous logic
-            // Combine flush and stall into one synchronous enable
-            if (~pipeline_flush && ~pipeline_stall) begin // ONLY update if NOT FLUSHED AND NOT STALLED
+        end else begin
+            if (~pipeline_flush && ~pipeline_stall) begin
                 id_ex_pc_plus_1_reg <= id_pc_plus_1;
                 id_ex_operand1_reg <= forward_operand1;
                 id_ex_operand2_reg <= (id_opcode == 4'h2 || id_opcode == 4'h4 || id_opcode == 4'h5) ? id_immediate : forward_operand2;
@@ -529,7 +524,6 @@ module pipeline_cpu(
                 id_ex_instr_reg <= id_instr;
                 id_ex_branch_pc_reg <= id_pc_plus_1 - 4'h1;
             end
-            // Implicitly holds if pipeline_stall or pipeline_flush is true
         end
     end
 
@@ -543,14 +537,14 @@ module pipeline_cpu(
     assign ex_is_branch_inst = id_ex_is_branch_inst_reg;
     assign ex_is_jump_inst = id_ex_is_jump_inst_reg;
     assign ex_branch_target = id_ex_branch_target_reg;
-    assign ex_branch_pc = id_ex_branch_pc_reg; // Corrected to use id_ex_branch_pc_reg
+    assign ex_branch_pc = id_ex_branch_pc_reg;
 
     wire [3:0] actual_branch_target_calc;
     assign actual_branch_target_calc = ex_branch_pc + ex_branch_target;
 
     // EX-MEM Pipeline Register
     always @(posedge clk or posedge reset) begin
-        if (reset) begin // Asynchronous reset
+        if (reset) begin
             ex_mem_alu_result_reg       <= 4'h0;
             ex_mem_mem_write_data_reg   <= 4'h0;
             ex_mem_rd_addr_reg          <= 3'h0;
@@ -563,9 +557,8 @@ module pipeline_cpu(
             ex_mem_pc_plus_1_reg        <= 4'h0;
             ex_mem_branch_target_reg    <= 4'h0;
             ex_mem_branch_pc_reg        <= 4'h0;
-        end else begin // Synchronous logic
-            // Combine flush and stall into one synchronous enable
-            if (~pipeline_flush && ~pipeline_stall) begin // ONLY update if NOT FLUSHED AND NOT STALLED
+        end else begin
+            if (~pipeline_flush && ~pipeline_stall) begin
                 ex_mem_alu_result_reg       <= ex_alu_result;
                 ex_mem_mem_write_data_reg   <= ex_alu_operand2;
                 ex_mem_rd_addr_reg          <= ex_rd_addr;
@@ -579,7 +572,6 @@ module pipeline_cpu(
                 ex_mem_branch_target_reg    <= actual_branch_target_calc;
                 ex_mem_branch_pc_reg        <= ex_branch_pc;
             end
-            // Implicitly holds if pipeline_stall or pipeline_flush is true
         end
     end
 
@@ -599,34 +591,29 @@ module pipeline_cpu(
     assign branch_mispredicted_local =
         (ex_mem_is_branch_inst_reg || ex_mem_is_jump_inst_reg) ?
             (ex_mem_is_branch_inst_reg ?
-                // Branch instruction misprediction logic
-                ((if_btb_predicted_taken != branch_actual_taken) || // Prediction was wrong (taken vs not taken)
-                 (branch_actual_taken && (if_btb_predicted_next_pc != branch_resolved_target_pc))) : // Taken, but target wrong
-                // Jump instruction misprediction logic (only target can be wrong)
-                (ex_mem_is_jump_inst_reg && (if_btb_predicted_next_pc != branch_resolved_target_pc))) : 1'b0; // No branch/jump instruction, so no misprediction
+                ((if_btb_predicted_taken != branch_actual_taken) ||
+                 (branch_actual_taken && (if_btb_predicted_next_pc != branch_resolved_target_pc))) :
+                (ex_mem_is_jump_inst_reg && (if_btb_predicted_next_pc != branch_resolved_target_pc))) : 1'b0;
 
     // Sequential registration for branch_mispredicted
     always @(posedge clk or posedge reset) begin
         if (reset) begin
             branch_mispredicted <= 1'b0;
         end else begin
-            // Only update if not stalled AND not flushed
             if (~pipeline_stall && ~pipeline_flush) begin
-                branch_mispredicted <= branch_mispredicted_local; // Register the combinational result
+                branch_mispredicted <= branch_mispredicted_local;
             end
-            // Implicitly holds if pipeline_stall or pipeline_flush is true
         end
     end
 
     // MEM-WB Pipeline Register
     always @(posedge clk or posedge reset) begin
-        if (reset) begin // Asynchronous reset
+        if (reset) begin
             mem_wb_write_data_reg <= 4'h0;
             mem_wb_rd_addr_reg <= 3'h0;
             mem_wb_reg_write_enable_reg <= 1'b0;
-        end else begin // Synchronous logic
-            // Combine flush and stall into one synchronous enable
-            if (~pipeline_flush && ~pipeline_stall) begin // ONLY update if NOT FLUSHED AND NOT STALLED
+        end else begin
+            if (~pipeline_flush && ~pipeline_stall) begin
                 if (mem_mem_read_enable) begin
                     mem_wb_write_data_reg <= mem_read_data;
                 end else begin
@@ -635,10 +622,8 @@ module pipeline_cpu(
                 mem_wb_rd_addr_reg <= mem_rd_addr;
                 mem_wb_reg_write_enable_reg <= mem_reg_write_enable;
             end
-            // Implicitly holds if pipeline_stall or pipeline_flush is true
         end
     end
-
 
     // --- WB Stage ---
     assign wb_write_data = mem_wb_write_data_reg;
@@ -650,12 +635,10 @@ module pipeline_cpu(
     assign debug_instr = if_instr;
     assign debug_stall = pipeline_stall;
     assign debug_flush = pipeline_flush;
-    assign debug_lock = (new_fsm_control_signal == 2'b11); // FSM state 2'b11 indicates lock
+    assign debug_lock = (new_fsm_control_signal == 2'b11);
     assign debug_fsm_entropy_log = new_fsm_entropy_log;
     assign debug_fsm_instr_type_log = new_fsm_instr_type_log;
     assign debug_hazard_flag = new_fsm_internal_hazard_flag;
     assign debug_fsm_state = new_fsm_control_signal;
-    assign debug_shock_detected = shock_detected_internal; // Expose shock detected from filter
-    assign debug_classified_entropy = classified_entropy_level_wire; // Expose classified entropy from decoder
-
-endmodule
+    assign debug_shock_detected = shock_detected_internal;
+    assign debug_classified_entropy = classified_entropy_level_wire;
